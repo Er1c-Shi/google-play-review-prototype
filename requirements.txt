@@ -1,0 +1,5 @@
+google-play-scraper
+pandas
+matplotlib
+notebook
+jupyter
