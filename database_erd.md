@@ -1,12 +1,4 @@
 ```mermaid
----
-config:
-  er:
-    useMaxWidth: false
-    layoutDirection: TB
-  themeVariables:
-    fontSize: 22px
----
 erDiagram
     data_sources ||--o{ apps : "has"
     data_sources ||--o{ ingestion_runs : "executes_on"
