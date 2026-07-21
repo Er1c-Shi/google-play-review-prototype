@@ -4,7 +4,7 @@ erDiagram
     data_sources ||--o{ ingestion_runs : "executes_on"
     apps ||--o{ reviews_raw : "contains"
     ingestion_runs ||--o{ reviews_raw : "produces"
-    reviews_raw ||--|| reviews_processed : "derives"
+    reviews_raw ||--o| reviews_processed : "derives"
     reviews_processed ||--o{ review_quality_flags : "may_have"
 
     data_sources {
@@ -18,7 +18,7 @@ erDiagram
     apps {
         int app_id PK
         int source_id FK
-        string source_app_identifier UK
+        string source_app_identifier
         string app_name
         string metadata_json
         datetime created_at
@@ -31,6 +31,14 @@ erDiagram
         datetime completed_at
         string status
         string sort_order
+        string country
+        string language
+        int target_review_count
+        int app_count
+        int total_fetched
+        int total_inserted
+        int skipped_duplicates
+        text error_summary
         string notes
     }
 
@@ -38,7 +46,7 @@ erDiagram
         int review_raw_id PK
         int ingestion_run_id FK
         int app_id FK
-        string source_review_id UK
+        string source_review_id
         text content
         int score
         int thumbs_up_count
@@ -47,6 +55,7 @@ erDiagram
         text reply_content
         datetime replied_at
         datetime collected_at
+        json raw_payload_json
     }
 
     reviews_processed {
@@ -69,3 +78,8 @@ erDiagram
         datetime detected_at
     }
 ```
+
+Composite unique constraints (not shown as single-column `UK` in Mermaid):
+
+- `apps`: `UNIQUE (source_id, source_app_identifier)`
+- `reviews_raw`: `UNIQUE (app_id, source_review_id)`

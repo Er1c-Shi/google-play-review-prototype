@@ -1,4 +1,4 @@
-# Database Schema Design
+# Database Schema Design (Version 2)
 
 This document proposes a relational database schema for the Google Play review prototype. The current implementation ingests reviews from Google Play only. The design prioritizes traceability and clarity for the prototype, while remaining extensible so that additional review sources could be incorporated later without major redesign.
 
@@ -99,8 +99,9 @@ The schema consists of six tables:
 
 **Primary key:** `source_id`
 
-**Foreign keys:** None
+**Unique constraints:** `source_code`
 
+**Foreign keys:** None
 
 ---
 
@@ -125,6 +126,10 @@ The schema consists of six tables:
 
 **Foreign keys:** `source_id` → `data_sources.source_id`
 
+**Unique constraints:** `UNIQUE (source_id, source_app_identifier)`
+
+**Design note:** `source_app_identifier` is not globally unique. The same identifier string could theoretically exist on different platforms; uniqueness is enforced only within a data source. This keeps the schema ready for additional review sources beyond Google Play.
+
 ---
 
 
@@ -141,8 +146,16 @@ The schema consists of six tables:
 | `started_at`   | Datetime | Run start time.                                     |
 | `completed_at` | Datetime | Run completion time.                                |
 | `status`       | String   | Run state (e.g., `running`, `completed`, `failed`). |
-| `sort_order`   | String   | Collection sort option used (e.g., `newest`).       |
-| `notes`        | String   | Optional run-level context or error summary.        |
+| `sort_order`          | String   | Collection sort option used (e.g., `newest`).                              |
+| `country`             | String   | Optional. Country/locale filter for the run (e.g., `US`).                    |
+| `language`            | String   | Optional. Language filter for the run (e.g., `en`).                          |
+| `target_review_count` | Integer  | Optional. Planned max reviews to fetch.                                      |
+| `app_count`           | Integer  | Optional. Number of apps targeted; default `0`.                              |
+| `total_fetched`       | Integer  | Optional. Reviews retrieved from source; default `0`.                        |
+| `total_inserted`      | Integer  | Optional. New rows inserted into `reviews_raw`; default `0`.                 |
+| `skipped_duplicates`  | Integer  | Optional. Reviews skipped by deduplication; default `0`.                   |
+| `error_summary`       | Text     | Optional. Summary of errors during the run.                                  |
+| `notes`               | String   | Optional run-level context.                                                  |
 
 
 **Primary key:** `run_id`
@@ -175,7 +188,8 @@ The schema consists of six tables:
 | `app_version`       | String   | App version associated with the review; may be null. |
 | `reply_content`     | Text     | Developer reply text; expected to be sparse.         |
 | `replied_at`        | Datetime | Developer reply timestamp; may be null.              |
-| `collected_at`      | Datetime | Timestamp when the record was ingested.              |
+| `collected_at`      | Datetime      | Timestamp when the record was ingested.              |
+| `raw_payload_json`  | JSON / Text   | Required. Full source review object; use `JSONB` in PostgreSQL or serialized JSON `TEXT` in SQLite. |
 
 
 **Primary key:** `review_raw_id`
@@ -184,6 +198,10 @@ The schema consists of six tables:
 
 - `ingestion_run_id` → `ingestion_runs.run_id`
 - `app_id` → `apps.app_id`
+
+**Unique constraints:** `UNIQUE (app_id, source_review_id)`
+
+**Design note:** `source_review_id` is unique within an app, not globally.
 
 ---
 
@@ -210,6 +228,8 @@ The schema consists of six tables:
 
 **Foreign keys:** `review_raw_id` → `reviews_raw.review_raw_id`
 
+**Unique constraints:** `review_raw_id`
+
 ---
 
 
@@ -225,7 +245,7 @@ The schema consists of six tables:
 | `review_processed_id` | Integer  | **Foreign key** → `reviews_processed.review_processed_id`                 |
 | `flag_type`           | String   | Flag category (e.g., `missing_app_version`, `duplicate_text_within_app`). |
 | `flag_value`          | String   | Optional detail or supporting value for the flag.                         |
-| `severity`            | String   | Qualitative severity (e.g., `info`, `warning`).                           |
+| `severity`            | String   | One of `info`, `warning`, or `error`.                                       |
 | `detected_at`         | Datetime | Timestamp when the flag was generated.                                    |
 
 
@@ -247,7 +267,7 @@ The schema consists of six tables:
 | `data_sources`      | `ingestion_runs`       | Each run belongs to one source (Google Play in the prototype) | `source_id`           | 1:N         |
 | `apps`              | `reviews_raw`          | Each raw review belongs to one app                            | `app_id`              | 1:N         |
 | `ingestion_runs`    | `reviews_raw`          | Each raw review is produced by one run                        | `ingestion_run_id`    | 1:N         |
-| `reviews_raw`       | `reviews_processed`    | Each processed review derives from one raw review             | `review_raw_id`       | 1:1         |
+| `reviews_raw`       | `reviews_processed`    | Each raw review may have zero or one current processed record.             | `review_raw_id`       | 0..1:1      |
 | `reviews_processed` | `review_quality_flags` | Each flag belongs to one processed review                     | `review_processed_id` | 1:N         |
 
 
@@ -285,6 +305,8 @@ A review is considered a duplicate if the same `source_review_id` already exists
 
 **Enforced by:** `UNIQUE (app_id, source_review_id)`
 
+`source_review_id` does not need to be globally unique—only unique within the same app.
+
 ---
 
 
@@ -296,11 +318,12 @@ Quality checks should be applied after raw ingestion and during or after process
 
 | Flag Type                   | Trigger                                                              | Severity  | Rationale                                                                                       |
 | --------------------------- | -------------------------------------------------------------------- | --------- | ----------------------------------------------------------------------------------------------- |
+| `missing_developer_reply`   | `reply_content` is null                                              | `info`    | Developer replies are commonly absent and should not mark a review as problematic.              |
 | `missing_app_version`       | `app_version` is null in raw data                                    | `info`    | App version is partially missing in the source data.                                            |
-| `missing_developer_reply`   | `reply_content` is null                                              | `info`    | Developer replies are sparse but expected.                                                      |
 | `duplicate_text_within_app` | Identical `content` appears for multiple reviews within the same app | `warning` | Indicates possible spam, templated feedback, or copy-paste behavior; not a deduplication event. |
 | `empty_review_text`         | `content` is null or blank after cleaning                            | `warning` | Review text is required for NLP workflows.                                                      |
-| `invalid_rating`            | `score` outside the expected Google Play range (1–5)                 | `warning` | Protects downstream analytics from malformed values.                                            |
+| `invalid_rating`            | `score` outside the expected Google Play range (1–5)                 | `error`   | Protects downstream analytics from malformed values.                                            |
 
+Possible future flag types (documentation only): `low_signal_text`, `possible_non_english`, `repeated_short_content`.
 
 ---
