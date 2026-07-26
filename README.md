@@ -8,7 +8,7 @@ A prototype project to evaluate Google Play Store reviews as a potential data so
 
 This repository explores whether Google Play reviews are suitable for building a review analytics pipeline. The work goes beyond data collection: it also assesses the quality, completeness, and usability of the collected review data before investing in a production-grade ingestion and analytics system.
 
-The prototype includes a Python collection script, raw and processed review datasets, an exploratory data analysis (EDA) notebook, and data quality checks. Reviews were collected from multiple Google Play applications.
+The prototype includes a Python collection script, raw and processed review datasets, an exploratory data analysis (EDA) notebook, data quality checks, a Version 2 SQLite schema, and a controlled sample load / validation flow. Reviews were collected from multiple Google Play applications.
 
 ---
 
@@ -20,7 +20,7 @@ The prototype includes a Python collection script, raw and processed review data
 - **Collect structured review data** — Gather reviews from multiple applications in a consistent, machine-readable format.
 - **Assess data quality** — Inspect completeness, uniqueness, duplication patterns, and field-level reliability.
 - **Document limitations** — Identify gaps and constraints that should inform future pipeline design.
-- **Inform next-stage architecture** — Use findings to guide database schema and ingestion design for multi-source, multi-app analytics.
+- **Design the database layer** — Define a Version 2 relational schema and ERD that capture apps, ingestion runs, raw/processed reviews, and quality flags.
 
 ---
 
@@ -32,11 +32,21 @@ The prototype includes a Python collection script, raw and processed review data
 google-play-review-prototype/
 ├── data/
 │   ├── raw/
-│   └── processed/
+│   ├── processed/
+│   └── samples/
+├── docs/
+│   └── database_integration_test.md
 ├── notebooks/
 │   └── eda_google_play_reviews.ipynb
 ├── src/
-│   └── collect_reviews.py
+│   ├── collect_reviews.py
+│   └── db/
+│       ├── schema.sql
+│       ├── init_db.py
+│       ├── load_sample.py
+│       └── validate_db.py
+├── database_schema.md
+├── database_erd.md
 ├── requirements.txt
 └── README.md
 ```
@@ -145,16 +155,14 @@ When using this dataset or extending the collection pipeline, keep the following
 
 
 
-## Future Work
+## Database Schema (Version 2)
 
-The next stage of this project is to design a scalable database schema and ingestion architecture that supports:
+A Version 2 relational schema and ERD are documented in this repository:
 
-- **Multiple data sources** — Google Play, Apple App Store, and other review platforms
-- **Multiple applications** — Unified storage and querying across apps
-- **Recurring ingestion runs** — Scheduled, incremental data collection
-- **Processed review storage** — Cleaned, normalized, and enriched review tables
-- **Data quality flags** — Automated tagging of missing fields, text duplicates, and anomalies
-- **Downstream analytics** — Sentiment analysis, topic modeling, and product analytics
+- **[database_schema.md](database_schema.md)** — table definitions, constraints, and design rationale
+- **[database_erd.md](database_erd.md)** — entity-relationship diagram
+
+A controlled SQLite integration test has been completed. Results are recorded in **[docs/database_integration_test.md](docs/database_integration_test.md)**.
 
 ---
 
@@ -199,6 +207,40 @@ jupyter notebook notebooks/eda_google_play_reviews.ipynb
 
 Open the notebook and execute cells sequentially to reproduce the data quality analysis.
 
+### 5. Initialize the SQLite database
+
+```bash
+python src/db/init_db.py
+```
+
+Creates `data/google_play_reviews.db` from `src/db/schema.sql` (foreign keys enabled).
+
+### 6. Load the controlled sample
+
+```bash
+python src/db/load_sample.py
+```
+
+Loads `data/samples/google_play_reviews_integration_sample.csv` into `data_sources`, `apps`, `ingestion_runs`, `reviews_raw`, `reviews_processed`, and basic `review_quality_flags`.
+
+### 7. Re-run to test deduplication
+
+```bash
+python src/db/load_sample.py
+```
+
+Running the loader again with the same sample should insert `0` new raw reviews and record `skipped_duplicates` on a new ingestion run.
+
+### 8. Validate relationships
+
+```bash
+python src/db/validate_db.py
+```
+
+Checks orphans, duplicate processed/flag rows, and foreign-key violations.
+
+Integration test results: **[docs/database_integration_test.md](docs/database_integration_test.md)**.
+
 ---
 
 
@@ -232,9 +274,14 @@ pip install -r requirements.txt
 | Path                                      | Description                                                      |
 | ----------------------------------------- | ---------------------------------------------------------------- |
 | `src/collect_reviews.py`                  | Batch review collection script                                   |
+| `src/db/`                                 | SQLite schema, init, sample loader, and validation scripts       |
 | `data/raw/`                               | Raw CSV exports from collection runs                             |
 | `data/processed/`                         | Cleaned or transformed review datasets                           |
+| `data/samples/`                           | Controlled sample used for database integration testing          |
+| `docs/database_integration_test.md`       | Recorded SQLite integration test results                         |
 | `notebooks/eda_google_play_reviews.ipynb` | Exploratory data analysis and quality checks                     |
+| `database_schema.md`                      | Version 2 relational database schema                             |
+| `database_erd.md`                         | Entity-relationship diagram for the Version 2 schema             |
 | `requirements.txt`                        | Python package dependencies                                      |
 | `.gitignore`                              | Excludes virtual environments, checkpoints, and local data files |
 
