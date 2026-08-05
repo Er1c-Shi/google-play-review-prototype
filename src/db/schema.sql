@@ -41,6 +41,23 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     FOREIGN KEY (source_id) REFERENCES data_sources (source_id)
 );
 
+-- Per-app execution result within an ingestion run.
+CREATE TABLE IF NOT EXISTS ingestion_run_apps (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    app_id INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    fetched_count INTEGER NOT NULL DEFAULT 0,
+    inserted_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs (run_id),
+    FOREIGN KEY (app_id) REFERENCES apps (app_id),
+    UNIQUE (run_id, app_id)
+);
+
 CREATE TABLE IF NOT EXISTS reviews_raw (
     review_raw_id INTEGER PRIMARY KEY,
     ingestion_run_id INTEGER NOT NULL,
@@ -67,6 +84,8 @@ CREATE TABLE IF NOT EXISTS reviews_processed (
     normalized_score INTEGER,
     text_length INTEGER,
     language_code TEXT,
+    has_developer_reply INTEGER NOT NULL DEFAULT 0
+        CHECK (has_developer_reply IN (0, 1)),
     processed_at TEXT NOT NULL,
     processing_version TEXT NOT NULL,
     FOREIGN KEY (review_raw_id) REFERENCES reviews_raw (review_raw_id)
@@ -82,6 +101,31 @@ CREATE TABLE IF NOT EXISTS review_quality_flags (
     FOREIGN KEY (review_processed_id) REFERENCES reviews_processed (review_processed_id)
 );
 
+-- Junction: records that a review was observed during a given ingestion run.
+-- Does not change reviews_raw deduplication (UNIQUE app_id, source_review_id).
+CREATE TABLE IF NOT EXISTS review_observations (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    review_raw_id INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs (run_id),
+    FOREIGN KEY (review_raw_id) REFERENCES reviews_raw (review_raw_id),
+    UNIQUE (run_id, review_raw_id)
+);
+
 -- Enforce at most one flag of each type per processed review (idempotent generation).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_review_quality_flags_processed_flag_type
 ON review_quality_flags (review_processed_id, flag_type);
+
+-- Lookup observations by review (unique constraint already indexes (run_id, review_raw_id)).
+CREATE INDEX IF NOT EXISTS ix_review_observations_review_raw_id
+ON review_observations (review_raw_id);
+
+CREATE INDEX IF NOT EXISTS ix_review_observations_observed_at
+ON review_observations (observed_at);
+
+CREATE INDEX IF NOT EXISTS ix_ingestion_run_apps_app_id
+ON ingestion_run_apps (app_id);
+
+CREATE INDEX IF NOT EXISTS ix_ingestion_run_apps_status
+ON ingestion_run_apps (status);

@@ -1,8 +1,19 @@
+"""
+Batch review collection for Google Play (CSV export workflow).
+
+Live reviews are dicts from google-play-scraper, annotated with app_name/app_id.
+For single-app live DB ingestion (no CSV), use:
+
+    python src/db/ingest_live_app.py --package-id com.spotify.music --n-reviews 50
+
+or call `ingest_live_app()` in `src/db/ingest_live_app.py`.
+"""
+
 import os
 import time
-import pandas as pd
-from google_play_scraper import reviews, Sort
 
+import pandas as pd
+from google_play_scraper import Sort, reviews
 
 APPS = {
     "Spotify": "com.spotify.music",
@@ -17,6 +28,15 @@ OUTPUT_PATH = "data/raw/google_play_reviews_sample.csv"
 
 
 def collect_reviews_for_app(app_name, app_id, n_reviews):
+    """
+    Fetch reviews for one app.
+
+    Returns a list of google-play-scraper review dicts, each annotated with:
+    - app_name (display name)
+    - app_id (Google Play package id)
+    Timestamps (`at`, `repliedAt`) remain datetime objects until CSV export or
+    ReviewRecord adaptation.
+    """
     all_reviews = []
     continuation_token = None
 

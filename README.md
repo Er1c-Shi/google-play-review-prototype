@@ -1,50 +1,45 @@
 # Google Play Review Prototype
 
-A prototype project to evaluate Google Play Store reviews as a potential data source for downstream product analytics and NLP applications.
+A prototype that evaluates Google Play Store reviews as a data source for downstream analytics, with a SQLite ingestion layer that supports both CSV loading and live Google Play collection.
+
+The repository includes collection scripts, EDA, a Version 2 relational schema, a shared record adapter, CSV and live ingestion paths, observation-aware deduplication, per-app run results, pytest scenarios, and a database validation script.
 
 ---
-
-## Project Overview
-
-This repository explores whether Google Play reviews are suitable for building a review analytics pipeline. The work goes beyond data collection: it also assesses the quality, completeness, and usability of the collected review data before investing in a production-grade ingestion and analytics system.
-
-The prototype includes a Python collection script, raw and processed review datasets, an exploratory data analysis (EDA) notebook, data quality checks, a Version 2 SQLite schema, and a controlled sample load / validation flow. Reviews were collected from multiple Google Play applications.
-
----
-
-
 
 ## Objectives
 
-- **Evaluate data suitability** — Determine whether Google Play reviews meet the requirements of a downstream review analytics pipeline.
-- **Collect structured review data** — Gather reviews from multiple applications in a consistent, machine-readable format.
-- **Assess data quality** — Inspect completeness, uniqueness, duplication patterns, and field-level reliability.
-- **Document limitations** — Identify gaps and constraints that should inform future pipeline design.
-- **Design the database layer** — Define a Version 2 relational schema and ERD that capture apps, ingestion runs, raw/processed reviews, and quality flags.
+- Evaluate whether Google Play reviews are suitable for a review analytics pipeline.
+- Collect structured reviews from multiple applications.
+- Assess completeness, uniqueness, duplication, and field reliability.
+- Persist data in a relational model that separates identity (`reviews_raw`), processing (`reviews_processed`), and sightings (`review_observations`).
+- Support CSV sample loads and live multi-app ingestion with clear run / per-app status.
 
 ---
-
-
 
 ## Repository Structure
 
 ```
 google-play-review-prototype/
 ├── data/
-│   ├── raw/
+│   ├── raw/                         # CSV exports from collect_reviews.py
 │   ├── processed/
-│   └── samples/
+│   └── samples/                     # Integration sample CSV
 ├── docs/
 │   └── database_integration_test.md
 ├── notebooks/
 │   └── eda_google_play_reviews.ipynb
 ├── src/
-│   ├── collect_reviews.py
+│   ├── collect_reviews.py           # CSV collection (google-play-scraper)
+│   ├── review_records.py            # Shared ReviewRecord adapters
 │   └── db/
 │       ├── schema.sql
 │       ├── init_db.py
-│       ├── load_sample.py
-│       └── validate_db.py
+│       ├── load_sample.py           # CSV → SQLite
+│       ├── ingest_live_app.py       # Live single-/multi-app → SQLite
+│       ├── validate_db.py
+│       ├── apply_migrations.py
+│       └── migrations/
+├── tests/                           # pytest suite (incl. live scenarios)
 ├── database_schema.md
 ├── database_erd.md
 ├── requirements.txt
@@ -53,238 +48,291 @@ google-play-review-prototype/
 
 ---
 
+## Current Database Architecture
 
+SQLite Version 2 schema (`src/db/schema.sql`). Details: **[database_schema.md](database_schema.md)**, **[database_erd.md](database_erd.md)**.
 
-## Data Source
+| Table | Role |
+| ----- | ---- |
+| `data_sources` | Source registry (e.g. Google Play) |
+| `apps` | One row per package (`source_app_identifier`) |
+| `ingestion_runs` | One collection/load execution |
+| `ingestion_run_apps` | Per-app result within a run (`fetched` / `inserted` / `skipped`, status, error) |
+| `reviews_raw` | Canonical review identity; deduped by `UNIQUE (app_id, source_review_id)` |
+| `review_observations` | Junction: review was seen in a run; `UNIQUE (run_id, review_raw_id)` |
+| `reviews_processed` | Derived fields for analytics (cleaned text, score, `has_developer_reply`, …) |
+| `review_quality_flags` | Quality issues on processed rows (version missing, empty text, etc.) |
 
-Reviews are sourced from the Google Play Store via public-facing review data. The collection script uses the google-play-scraper Python library to retrieve review records for configured applications.
+Default DB path: `data/google_play_reviews.db` (override with `--db-path` on all DB scripts).
 
-Each review record typically includes fields such as:
+### Raw, processed, and observation
 
-
-| Field                        | Description                      |
-| ---------------------------- | -------------------------------- |
-| `reviewId`                   | Unique identifier for the review |
-| `content`                    | Review text                      |
-| `score`                      | Star rating                      |
-| `at`                         | Review timestamp                 |
-| `app_id` / `app_name`        | Application identifiers          |
-| `appVersion`                 | App version at time of review    |
-| `replyContent` / `repliedAt` | Developer reply, if present      |
-
-
----
-
-
-
-## Data Collection Workflow
-
-1. **Configure target applications** — Define the set of Google Play applications to collect in `src/collect_reviews.py`.
-2. **Fetch reviews in batches** — The script retrieves reviews using the Newest sort order, paginating until the configured limit is reached per application.
-3. **Enrich records** — Each review is annotated with `app_name` and `app_id` for downstream multi-app analysis.
-4. **Export to CSV** — Collected reviews are written to `data/raw/google_play_reviews_sample.csv`.
-5. **Run quality checks** — Use the EDA notebook to inspect structure, completeness, and duplication patterns.
-
-```bash
-python src/collect_reviews.py
+```
+ingestion run
+    │
+    ├─ ingestion_run_apps (per app: counts + status)
+    │
+    └─ for each fetched review
+           ├─ reviews_raw          ← insert only if (app_id, source_review_id) is new
+           ├─ review_observations  ← always record (run_id, review_raw_id) when seen
+           └─ reviews_processed + quality flags
+                                   ← only for newly inserted raw rows
 ```
 
----
+- **`reviews_raw`** stores the durable review identity and payload. Reloading the same Google Play `reviewId` for an app does **not** create another raw row.
+- **`review_observations`** records that a run observed a review. The same raw review can appear in many runs; the same pair `(run_id, review_raw_id)` cannot.
+- **`reviews_processed`** is created once per raw review (on first insert). Skip paths do not recreate processed rows.
 
+### Developer reply: availability feature, not a quality flag
 
+Most public reviews have no developer reply. That is expected, not a data defect.
 
-## Exploratory Data Analysis
+- Reply text / timestamp stay on `reviews_raw` (`reply_content`, `repliedAt`).
+- `reviews_processed.has_developer_reply` is a boolean (SQLite `0`/`1`) set at processing time from non-empty trimmed `reply_content`.
+- `missing_developer_reply` is **not** written to `review_quality_flags`.
 
-The notebook `notebooks/eda_google_play_reviews.ipynb` performs an initial exploratory analysis of the collected dataset. The analysis covers:
-
-- Review ID uniqueness
-- Duplicate review IDs
-- Duplicate review text within the same app
-- Missing values
-- Rating distribution
-- Timestamp coverage
-- App version availability
-- Developer reply availability
-- Basic review quality inspection
+Current quality flag types: `missing_app_version`, `duplicate_text_within_app`, `empty_review_text`, `invalid_rating`.
 
 ---
-
-
-
-## Key Findings
-
-- **Review IDs are stable** — Review IDs appear consistent and suitable for deduplication.
-- **Core fields are reliably present** — Ratings, timestamps, app IDs, and review text are consistently available.
-- **App version data is partially missing** — Version information is present for many records but not universally populated.
-- **Developer replies are sparse** — Reply fields are largely empty, which is expected for public review data.
-- **Identical review text can appear across users** — Repeated text within an app should be treated as a quality flag, not as evidence of duplicate records.
-- **Newest-sort bias** — Because reviews are collected using the Newest sorting option, the dataset primarily reflects recent user feedback rather than a complete historical record.
-
----
-
-
-
-## Data Quality Considerations
-
-When using this dataset or extending the collection pipeline, keep the following in mind:
-
-
-| Consideration      | Recommendation                                                                                                        |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| Deduplication key  | Use `reviewId` as the primary deduplication identifier.                                                               |
-| Text duplication   | Flag identical `content` within the same app for manual or automated review; do not automatically drop as duplicates. |
-| App version        | Treat `appVersion` as optional metadata; do not assume full coverage.                                                 |
-| Developer replies  | Model reply fields as sparse optional attributes.                                                                     |
-| Temporal coverage  | Account for recency bias introduced by Newest-sort collection.                                                        |
-| Multi-app analysis | Always join or filter on `app_id` to avoid cross-app aggregation errors.                                              |
-
-
----
-
-
-
-## Current Limitations
-
-- **Recency bias** — The dataset represents recently posted reviews, not the full review history of each application.
-- **Incomplete version metadata** — App version fields are not available for all records.
-- **Prototype scope** — Collection, storage, and quality checks are designed for evaluation, not production-scale ingestion.
-- **Single data source** — Only Google Play reviews are included; other app store sources are out of scope for this prototype.
-- **No automated pipeline** — Ingestion is script-based with no scheduling, monitoring, or incremental update mechanism.
-
----
-
-
-
-## Database Schema (Version 2)
-
-A Version 2 relational schema and ERD are documented in this repository:
-
-- **[database_schema.md](database_schema.md)** — table definitions, constraints, and design rationale
-- **[database_erd.md](database_erd.md)** — entity-relationship diagram
-
-A controlled SQLite integration test has been completed. Results are recorded in **[docs/database_integration_test.md](docs/database_integration_test.md)**.
-
----
-
-
 
 ## How to Run
 
-
-
-### 1. Clone the repository
+### 1. Clone and install
 
 ```bash
 git clone <repository-url>
 cd google-play-review-prototype
-```
 
-
-
-### 2. Create a virtual environment and install dependencies
-
-```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+**Python:** 3.10+ recommended.  
+**Environment variables:** none required. Paths and targets are set via CLI flags or constants in `src/collect_reviews.py`.
 
+### 2. Configure the database
 
-### 3. Collect reviews
+```bash
+python src/db/init_db.py
+# optional:
+python src/db/init_db.py --db-path data/google_play_reviews.db
+```
+
+Creates the SQLite file from `schema.sql` with foreign keys enabled. Safe to re-run (`CREATE TABLE IF NOT EXISTS`).
+
+Existing DBs may need migrations under `src/db/migrations/` if they were created before later schema additions (`review_observations`, `has_developer_reply`, `ingestion_run_apps`). Fresh `init_db` already includes the full current schema.
+
+```bash
+# Preferred upgrade helper (bootstraps empty DBs via init_db; skips 002 if column exists)
+python src/db/apply_migrations.py --db-path data/google_play_reviews.db
+```
+
+### 3. Run the CSV loader
+
+Uses the controlled sample by default:
+
+```bash
+python src/db/load_sample.py
+
+python src/db/load_sample.py \
+  --db-path data/google_play_reviews.db \
+  --sample-path data/samples/google_play_reviews_integration_sample.csv
+```
+
+What it does:
+
+1. Ensures `data_sources` / `apps` from the CSV.
+2. Creates an `ingestion_runs` row and per-app `ingestion_run_apps` results.
+3. Inserts new `reviews_raw` rows; skips existing `(app_id, source_review_id)`.
+4. Writes `review_observations` for every valid row in the load.
+5. Creates `reviews_processed` + quality flags only for newly inserted raw rows.
+
+Re-running the same sample: `total_inserted = 0`, `skipped_duplicates` equals fetched count, observations are added for the new run, raw count unchanged.
+
+### 4. Choose apps
+
+**CSV batch collection** (`src/collect_reviews.py`) — edit the `APPS` map and `REVIEWS_PER_APP`:
+
+```python
+APPS = {
+    "Spotify": "com.spotify.music",
+    "Duolingo": "com.duolingo",
+    # ...
+}
+```
 
 ```bash
 python src/collect_reviews.py
+# → data/raw/google_play_reviews_sample.csv
 ```
 
-Output is saved to `data/raw/google_play_reviews_sample.csv`.
+**CSV loader** — apps are taken from columns in the sample CSV (`app_id` / package id and `app_name`). New packages are inserted into `apps` during load.
 
-### 4. Run exploratory data analysis
+**Live ingestion** — apps must **already exist** in `apps` (for example after a CSV load). Select targets on the CLI:
+
+| Mode | How to select |
+| ---- | ------------- |
+| Single app | `--package-id com.spotify.music` **or** `--app-id <apps.app_id>` |
+| Multi-app | Repeat `--package-id` once per app |
+
+Live ingest does not create missing apps; unknown package / app id raises `LookupError`.
+
+### 5. Run the live ingestion pipeline
+
+Requires network access (calls `google-play-scraper`). Reviews are adapted through the shared `ReviewRecord` path and written with the same dedup / observation / processing rules as the CSV loader.
+
+```bash
+# Single app
+python src/db/ingest_live_app.py --package-id com.spotify.music --n-reviews 50
+
+# Multi-app (one ingestion_runs row; each app committed independently)
+python src/db/ingest_live_app.py \
+  --package-id com.spotify.music \
+  --package-id com.duolingo \
+  --n-reviews 50
+
+# Optional DB path / internal app id (single-app only)
+python src/db/ingest_live_app.py --app-id 1 --n-reviews 50 --db-path data/google_play_reviews.db
+```
+
+Behavior:
+
+- Creates one `ingestion_runs` row for the pipeline invocation.
+- For each app: starts `ingestion_run_apps`, collects, writes reviews, finalizes counts/status.
+- A later app failure does **not** roll back earlier apps’ committed data.
+- Multi-app terminal run status is derived from per-app outcomes (see below).
+
+### 6. Ingestion run and per-app status
+
+**`ingestion_run_apps.status`**
+
+| Status | Meaning |
+| ------ | ------- |
+| `running` | App result started; should not remain after a finished pipeline |
+| `completed` | App finished with at least some inserts and/or skips (may still note per-review errors in `error_message`) |
+| `failed` | App produced no inserts and no skips, with an `error_message` (e.g. collector exception) |
+
+Counts on each app result:
+
+- `fetched_count` — reviews accepted into the ingest loop for that app
+- `inserted_count` — new `reviews_raw` rows
+- `skipped_count` — already-known reviews (still observed)
+
+For a normal completed app: `inserted_count + skipped_count = fetched_count`.
+
+**`ingestion_runs.status` (multi-app)**
+
+| Status | Meaning |
+| ------ | ------- |
+| `completed` | Every app result is `completed` |
+| `partial` | Mix of `completed` and `failed` apps |
+| `failed` | Every app failed (or no app results) |
+| `running` | In progress; finished runs set `completed_at` |
+
+CSV `load_sample` runs finalize as `completed` when the load finishes successfully.
+
+### 7. Three main live test scenarios
+
+These use a **mocked collector** and a real SQLite write path (no live Google Play dependency):
+
+```bash
+# 1) First collection on an empty review store
+python -m pytest tests/test_first_live_collection.py -v -s
+
+# 2) Immediate repeat of the same review set (all skips, new observations)
+python -m pytest tests/test_immediate_repeat_collection.py -v -s
+
+# 3) Partial overlap (A,B,C then B,C,D,E)
+python -m pytest tests/test_partial_overlap_collection.py -v -s
+```
+
+Related multi-app error handling (partial / all-failed):
+
+```bash
+python -m pytest tests/test_ingest_live_apps.py -v -s
+```
+
+Full suite:
+
+```bash
+python -m pytest tests/ -q
+```
+
+CSV reload integration (needs the sample under `data/samples/`):
+
+```bash
+python -m pytest tests/test_load_sample_observations.py::test_integration_sample_two_loads_preserve_counts -v -s
+```
+
+### 8. Run the validation script
+
+```bash
+python src/db/validate_db.py
+python src/db/validate_db.py --db-path data/google_play_reviews.db
+```
+
+Each check prints `[PASS]` or `[FAIL]` with sample offending rows on failure. Exit code `0` = all pass, `1` = any fail.
+
+Checks include: raw / observation uniqueness, observation FK integrity, non-negative and consistent per-app counts, terminal-run timestamps, running-state sanity, failed apps having error messages, no `missing_developer_reply` flags, and `has_developer_reply` vs reply content.
+
+Recorded CSV integration notes: **[docs/database_integration_test.md](docs/database_integration_test.md)**.
+
+### 9. Optional: EDA notebook
 
 ```bash
 jupyter notebook notebooks/eda_google_play_reviews.ipynb
 ```
 
-Open the notebook and execute cells sequentially to reproduce the data quality analysis.
+---
 
-### 5. Initialize the SQLite database
+## Common Errors
 
-```bash
-python src/db/init_db.py
-```
+| Symptom | Cause / fix |
+| ------- | ----------- |
+| `LookupError: No app with package_id=...` | Live ingest requires an existing `apps` row. Load a CSV sample first, or insert the app, then re-run with that `--package-id`. |
+| `Database not found` from `validate_db.py` | Run `init_db` / a loader first, or pass the correct `--db-path`. |
+| Live ingest hangs / network errors | Live mode calls Google Play via `google-play-scraper`. Needs outbound network; CSV loader and mocked pytest scenarios do not. |
+| `Multi-app mode accepts repeated --package-id only` | Do not combine multi `--package-id` with `--app-id` / `--run-id`. |
+| Stuck `running` rows after a crash | Finished pipelines clear terminal status; a hard kill mid-app can leave `running`. Re-run or inspect `ingestion_runs` / `ingestion_run_apps`. |
+| Migration errors on an old DB file | Prefer `python src/db/apply_migrations.py`. Raw `002` SQL fails if the column already exists or if `reviews_processed` is missing — use `init_db` for brand-new DBs. |
 
-Creates `data/google_play_reviews.db` from `src/db/schema.sql` (foreign keys enabled).
-
-### 6. Load the controlled sample
-
-```bash
-python src/db/load_sample.py
-```
-
-Loads `data/samples/google_play_reviews_integration_sample.csv` into `data_sources`, `apps`, `ingestion_runs`, `reviews_raw`, `reviews_processed`, and basic `review_quality_flags`.
-
-### 7. Re-run to test deduplication
-
-```bash
-python src/db/load_sample.py
-```
-
-Running the loader again with the same sample should insert `0` new raw reviews and record `skipped_duplicates` on a new ingestion run.
-
-### 8. Validate relationships
-
-```bash
-python src/db/validate_db.py
-```
-
-Checks orphans, duplicate processed/flag rows, and foreign-key violations.
-
-Integration test results: **[docs/database_integration_test.md](docs/database_integration_test.md)**.
+**Environment variables:** this prototype does not read API keys or DB URLs from the environment. Configure only via CLI flags and `src/collect_reviews.py` constants.
 
 ---
 
+## Data Quality Notes
 
+| Topic | Behavior in this codebase |
+| ----- | ------------------------- |
+| Dedup key | `(app_id, source_review_id)` on `reviews_raw` (`source_review_id` ← Google Play `reviewId`) |
+| Text duplication | Flagged as `duplicate_text_within_app`; raw rows are not dropped |
+| App version | Optional; missing values may yield `missing_app_version` |
+| Developer replies | Availability via `has_developer_reply`; not a quality flag |
+| Sort order | Live/CSV collection uses Newest sort → recency bias |
+
+---
+
+## Current Limitations
+
+- Newest-sort collection reflects recent reviews, not full history.
+- App version metadata is incomplete for some reviews.
+- Scope is evaluation/prototype: script-based ingestion, no scheduler or production monitoring.
+- Live ingest assumes apps were registered beforehand (e.g. via CSV load).
+- Single store: Google Play only.
+
+---
 
 ## Requirements
 
-
-| Package                | Purpose                                  |
-| ---------------------- | ---------------------------------------- |
-| `google-play-scraper`  | Fetch reviews from the Google Play Store |
-| `pandas`               | Data manipulation and CSV export         |
-| `matplotlib`           | Visualization in the EDA notebook        |
-| `jupyter` / `notebook` | Interactive notebook environment         |
-
-
-Install all dependencies with:
+| Package | Purpose |
+| ------- | ------- |
+| `google-play-scraper` | Fetch reviews from Google Play |
+| `pandas` | CSV export in `collect_reviews.py` |
+| `matplotlib` | EDA notebook charts |
+| `jupyter` / `notebook` | EDA notebook |
+| `pytest` | Automated tests |
 
 ```bash
 pip install -r requirements.txt
 ```
-
-**Python version:** 3.10 or later recommended.
-
----
-
-
-
-## Project Structure
-
-
-| Path                                      | Description                                                      |
-| ----------------------------------------- | ---------------------------------------------------------------- |
-| `src/collect_reviews.py`                  | Batch review collection script                                   |
-| `src/db/`                                 | SQLite schema, init, sample loader, and validation scripts       |
-| `data/raw/`                               | Raw CSV exports from collection runs                             |
-| `data/processed/`                         | Cleaned or transformed review datasets                           |
-| `data/samples/`                           | Controlled sample used for database integration testing          |
-| `docs/database_integration_test.md`       | Recorded SQLite integration test results                         |
-| `notebooks/eda_google_play_reviews.ipynb` | Exploratory data analysis and quality checks                     |
-| `database_schema.md`                      | Version 2 relational database schema                             |
-| `database_erd.md`                         | Entity-relationship diagram for the Version 2 schema             |
-| `requirements.txt`                        | Python package dependencies                                      |
-| `.gitignore`                              | Excludes virtual environments, checkpoints, and local data files |
-
-
----
-
